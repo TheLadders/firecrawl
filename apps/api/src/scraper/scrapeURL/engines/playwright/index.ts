@@ -28,6 +28,7 @@ export async function scrapeURLWithPlaywright(
       schema: z.object({
         content: z.string(),
         pageStatusCode: z.number(),
+        url: z.string(),
         pageError: z.string().optional(),
         contentType: z.string().optional(),
       }),
@@ -48,7 +49,7 @@ export async function scrapeURLWithPlaywright(
   }
 
   return {
-    url: meta.rewrittenUrl ?? meta.url, // TODO: impove redirect following
+    url: response.url ?? meta.rewrittenUrl ?? meta.url, // TODO: impove redirect following
     html: response.content,
     statusCode: response.pageStatusCode,
     error: response.pageError,
