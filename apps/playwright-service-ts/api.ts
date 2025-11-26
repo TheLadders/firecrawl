@@ -42,12 +42,38 @@ const AD_SERVING_DOMAINS = [
   "amazon-adsystem.com",
 ];
 
+interface Action {
+  type:
+    | "wait"
+    | "click"
+    | "screenshot"
+    | "write"
+    | "press"
+    | "scroll"
+    | "scrape"
+    | "executeJavascript";
+  milliseconds?: number;
+  selector?: string;
+  all?: boolean;
+  fullPage?: boolean;
+  quality?: number;
+  viewport?: { width: number; height: number };
+  text?: string;
+  key?: string;
+  direction?: "up" | "down";
+  script?: string;
+  landscape?: boolean;
+  scale?: number;
+  format?: string;
+}
+
 interface UrlModel {
   url: string;
   wait_after_load?: number;
   timeout?: number;
   headers?: { [key: string]: string };
   check_selector?: string;
+  actions?: Action[];
 }
 
 let browser: Browser;
@@ -124,6 +150,142 @@ const isValidUrl = (urlString: string): boolean => {
   }
 };
 
+const executeAction = async (
+  page: Page,
+  action: Action,
+  actionIndex: number,
+  timeout: number
+): Promise<any> => {
+  console.log(`Executing action ${actionIndex + 1}: ${action.type}`);
+
+  switch (action.type) {
+    case "wait":
+      if (
+        action.milliseconds !== undefined &&
+        action.milliseconds !== null
+      ) {
+        await page.waitForTimeout(action.milliseconds);
+      } else if (action.selector) {
+        await page.waitForSelector(action.selector, {
+          timeout: action.milliseconds ?? timeout,
+        });
+      }
+      return null;
+
+    case "click":
+      if (!action.selector) {
+        throw new Error("Click action requires a selector");
+      }
+      if (action.all) {
+        const elements = await page.locator(action.selector).all();
+        for (const element of elements) {
+          await element.click();
+        }
+      } else {
+        await page.click(action.selector);
+      }
+      return null;
+
+    case "write":
+      if (!action.text) {
+        throw new Error("Write action requires a text");
+      }
+      await page.keyboard.type(action.text);
+      return null;
+
+    case "press":
+      if (!action.key) {
+        throw new Error("Press action requires a key");
+      }
+      await page.keyboard.press(action.key);
+      return null;
+
+    case "scroll":
+      if (action.selector) {
+        await page.locator(action.selector).scrollIntoViewIfNeeded();
+      } else {
+        const direction = action.direction === "up" ? -1 : 1;
+        await page.evaluate((dir) => {
+          const scrollHeight = document.body.scrollHeight;
+          const deltaY = dir === -1 ? -scrollHeight : scrollHeight;
+          window.scrollBy(0, deltaY);
+        }, direction);
+      }
+      return null;
+
+    case "screenshot":
+      const screenshotOptions: any = {
+        fullPage: action.fullPage || false,
+      };
+      if (action.quality) {
+        screenshotOptions.quality = action.quality;
+      }
+      if (action.viewport) {
+        await page.setViewportSize(action.viewport);
+      }
+      const screenshot = await page.screenshot(screenshotOptions);
+      return Buffer.from(screenshot).toString("base64");
+
+    case "scrape":
+      const html = await page.content();
+      const currentUrl = page.url();
+      return { url: currentUrl, html };
+
+    case "executeJavascript":
+      if (!action.script) {
+        throw new Error("ExecuteJavascript action requires a script");
+      }
+      const jsResult = await page.evaluate(action.script);
+      return { type: "executeJavascript", value: jsResult };
+
+    default:
+      console.warn(`Unknown action type: ${action.type}`);
+      return null;
+  }
+};
+
+const executeActions = async (
+  page: Page,
+  actions: Action[],
+  timeout: number
+): Promise<{
+  screenshots: string[];
+  actionContent: Array<{ url: string; html: string }>;
+  actionResults: Array<{ type: string; result: any }>;
+}> => {
+  const screenshots: string[] = [];
+  const actionContent: Array<{ url: string; html: string }> = [];
+  const actionResults: Array<{ type: string; result: any }> = [];
+
+  for (let i = 0; i < actions.length; i++) {
+    const action = actions[i];
+    try {
+      const result = await executeAction(page, action, i, timeout);
+
+      if (result !== null) {
+        if (action.type === "screenshot") {
+          screenshots.push(result);
+        } else if (action.type === "scrape") {
+          actionContent.push(result);
+        } else if (action.type === "executeJavascript") {
+          actionResults.push({
+            type: action.type,
+            result:
+              action.type === "executeJavascript"
+                ? { return: JSON.stringify(result.value) }
+                : { link: result },
+          });
+        }
+      }
+    } catch (error) {
+      console.error(`Error executing action ${i + 1} (${action.type}):`, error);
+      // Continue with next action
+    }
+  }
+
+  return { screenshots, actionContent, actionResults };
+};
+
 const scrapePage = async (
   page: Page,
   url: string,
@@ -131,6 +293,7 @@ const scrapePage = async (
   waitAfterLoad: number,
   timeout: number,
   checkSelector: string | undefined,
+  actions: Action[] | undefined,
 ) => {
   console.log(
     `Navigating to ${url} with waitUntil: ${waitUntil} and timeout: ${timeout}ms`,
@@ -146,6 +309,19 @@ const scrapePage = async (
       await page.waitForSelector(checkSelector, { timeout });
     } catch (error) {
       throw new Error("Required selector not found");
+    }
+  }
+
+  // Execute actions if provided
+  let actionResults: any = {};
+  if (actions && actions.length > 0) {
+    console.log(`Executing ${actions.length} actions`);
+    try {
+      actionResults = await executeActions(page, actions, timeout);
+    } catch (error) {
+      console.error('Error executing actions:', error);
+      // Continue without action results
+      actionResults = { screenshots: [], actionContent: [], actionResults: [] };
     }
   }
 
@@ -171,6 +347,7 @@ const scrapePage = async (
     status: response ? response.status() : null,
     headers,
     contentType: ct,
+    ...actionResults,
   };
 };
 
@@ -185,6 +362,7 @@ app.post("/scrape", async (req: Request, res: Response) => {
     timeout = 15000,
     headers,
     check_selector,
+    actions,
   }: UrlModel = req.body;
 
   console.log(`================= Scrape Request =================`);
@@ -193,6 +371,7 @@ app.post("/scrape", async (req: Request, res: Response) => {
   console.log(`Timeout: ${timeout}`);
   console.log(`Headers: ${headers ? JSON.stringify(headers) : "None"}`);
   console.log(`Check Selector: ${check_selector ? check_selector : "None"}`);
+  console.log(`Actions: ${actions ? JSON.stringify(actions) : "None"}`);
   console.log(`==================================================`);
   if (!url || !isValidUrl(url)) {
     return res.status(400).json({ error: "URL is invalid or missing" });
@@ -219,6 +398,7 @@ app.post("/scrape", async (req: Request, res: Response) => {
         wait_after_load,
         timeout,
         check_selector,
+        actions,
       );
     } catch (error) {
       console.log(
@@ -234,6 +414,7 @@ app.post("/scrape", async (req: Request, res: Response) => {
         wait_after_load,
         timeout,
         check_selector,
+        actions,
       );
     }
 
@@ -247,13 +428,25 @@ app.post("/scrape", async (req: Request, res: Response) => {
       );
     }
 
-    res.json({
+    const response: any = {
       url: result.url,
       content: result.content,
       pageStatusCode: result.status,
       contentType: result.contentType,
       ...(pageError && { pageError }),
-    });
+    };
+
+    // Add screenshots if available
+    if (result.screenshots) {
+      response.screenshots = result.screenshots;
+    }
+    if (result.actionContent) {
+      response.actionContent = result.actionContent;
+    }
+    if (result.actionResults) {
+      response.actionResults = result.actionResults;
+    }
+    res.json(response);
   } catch (finalError) {
     // This catches errors from both strategies
     console.error("Both scraping strategies failed.", finalError);
